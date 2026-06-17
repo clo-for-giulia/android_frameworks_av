@@ -80,6 +80,8 @@
 // QTI_BEGIN: 2021-12-19: Video: libmediaplayerservice: Parallelize Video and Audio Encoder setup am: dc072421d3
 #include <future>
 // QTI_END: 2021-12-19: Video: libmediaplayerservice: Parallelize Video and Audio Encoder setup am: dc072421d3
+#include <mutex>
+#include <unordered_map>
 
 #include <system/audio.h>
 
@@ -92,6 +94,29 @@
 #include <com_android_media_editing_flags.h>
 
 namespace android {
+
+// [PATCH OPLUSHDR] ABI-safe storage for Oplus user data
+static std::mutex sOplusUserDataLock;
+static std::unordered_map<const StagefrightRecorder*, AString> sOplusUserDataMap;
+
+static void setOplusUserData(const StagefrightRecorder* recorder, const AString& val) {
+    std::lock_guard<std::mutex> lock(sOplusUserDataLock);
+    sOplusUserDataMap[recorder] = val;
+}
+
+static AString getOplusUserData(const StagefrightRecorder* recorder) {
+    std::lock_guard<std::mutex> lock(sOplusUserDataLock);
+    auto it = sOplusUserDataMap.find(recorder);
+    if (it != sOplusUserDataMap.end()) {
+        return it->second;
+    }
+    return AString();
+}
+
+static void clearOplusUserData(const StagefrightRecorder* recorder) {
+    std::lock_guard<std::mutex> lock(sOplusUserDataLock);
+    sOplusUserDataMap.erase(recorder);
+}
 
 static const float kTypicalDisplayRefreshingRate = 60.f;
 // display refresh rate drops on battery saver
@@ -179,6 +204,7 @@ StagefrightRecorder::StagefrightRecorder(const AttributionSourceState& client)
 
 StagefrightRecorder::~StagefrightRecorder() {
     ALOGV("Destructor");
+    clearOplusUserData(this);
     stop();
 
     if (mLooper != NULL) {
@@ -1200,6 +1226,10 @@ status_t StagefrightRecorder::setParameter(
         }
     } else if (key == "log-session-id") {
         return setLogSessionId(value);
+    } else if (key == "OplusUserData") {
+        // [PATCH OPLUSHDR] Record and pass parameter to Muxer
+        setOplusUserData(this, value);
+        return OK;
     } else {
         ALOGE("setParameter: failed to find key %s", key.c_str());
     }
@@ -2344,7 +2374,7 @@ status_t StagefrightRecorder::setupVideoEncoder(
     sp<MediaCodecSource> encoder = MediaCodecSource::Create(
             mLooper, format, cameraSource, mPersistentSurface, flags);
     if (encoder == NULL) {
-        ALOGE("Failed to create video encoder");
+        ALOGE("[PATCH OPLUS] FATAL: Failed to create video encoder!");
         // When the encoder fails to be created, we need
         // release the camera source due to the camera's lock
         // and unlock mechanism.
@@ -2540,6 +2570,12 @@ void StagefrightRecorder::setupMPEG4orWEBMMetaData(sp<MetaData> *meta) {
     if (mOutputFormat == OUTPUT_FORMAT_MPEG_4 || mOutputFormat == OUTPUT_FORMAT_THREE_GPP) {
         (*meta)->setInt32(kKeyEmptyTrackMalFormed, true);
         (*meta)->setInt32(kKey4BitTrackIds, true);
+    }
+
+    // [PATCH OPLUSHDR] Pass metadata to MPEG4Writer
+    AString oplusUserData = getOplusUserData(this);
+    if (!oplusUserData.empty()) {
+        (*meta)->setCString(kKeyOplusUserData, oplusUserData.c_str());
     }
 }
 
@@ -2782,6 +2818,7 @@ status_t StagefrightRecorder::close() {
 
 status_t StagefrightRecorder::reset() {
     ALOGV("reset");
+    clearOplusUserData(this);
     stop();
 
     // No audio or video source by default
